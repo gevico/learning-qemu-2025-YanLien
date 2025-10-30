@@ -53,11 +53,14 @@ static void g233_soc_init(Object *obj)
      * You can add more devices here(e.g. cpu, gpio)
      * Attention: The cpu resetvec is 0x1004
      */
-    MachineState *ms = MACHINE(qdev_get_machine());
     G233SoCState *s = RISCV_G233_SOC(obj);
+
     object_initialize_child(obj, "cpus", &s->cpus, TYPE_RISCV_HART_ARRAY);
-    object_property_set_int(OBJECT(&s->cpus), "num-harts", ms->smp.cpus,
-                            &error_abort);
+    qdev_prop_set_uint32(DEVICE(&s->cpus), "num-harts", 1);
+    qdev_prop_set_uint32(DEVICE(&s->cpus), "hartid-base", 0);
+    qdev_prop_set_string(DEVICE(&s->cpus), "cpu-type", TYPE_RISCV_CPU_GEVICO_G233);
+    qdev_prop_set_uint64(DEVICE(&s->cpus), "resetvec", 0x1004);
+    object_initialize_child(obj, "gpio", &s->gpio, TYPE_SIFIVE_GPIO);
 }
 
 static void g233_soc_realize(DeviceState *dev, Error **errp)
@@ -68,8 +71,6 @@ static void g233_soc_realize(DeviceState *dev, Error **errp)
     const MemMapEntry *memmap = g233_memmap;
 
     /* CPUs realize */
-    object_property_set_str(OBJECT(&s->cpus), "cpu-type", ms->cpu_type,
-                            &error_abort);
     sysbus_realize(SYS_BUS_DEVICE(&s->cpus), &error_fatal);
 
     /* Mask ROM */
