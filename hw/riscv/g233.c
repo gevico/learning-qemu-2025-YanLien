@@ -157,6 +157,7 @@ static void g233_machine_init(MachineState *machine)
     const MemMapEntry *memmap = g233_memmap;
 
     G233MachineState *s = RISCV_G233_MACHINE(machine);
+    MemoryRegion *sys_mem = get_system_memory();
     int i;
     RISCVBootInfo boot_info;
 
