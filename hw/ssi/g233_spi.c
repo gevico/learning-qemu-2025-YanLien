@@ -14,7 +14,7 @@
 #include "qemu/fifo8.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "migration/vmstate.h" 
+#include "migration/vmstate.h"
 #include "hw/ssi/g233_spi.h"
 
 #define FIFO_CAPACITY   8
@@ -22,25 +22,22 @@
 static void g233_spi_txfifo_reset(G233SPIState *s)
 {
     fifo8_reset(&s->tx_fifo);
-    s->regs[R_SPI_SR] |= SPI_SR_TXE;  /* TXE = 1 (空) */
+    s->regs[R_SPI_SR] |= SPI_SR_TXE;
 }
 
 static void g233_spi_rxfifo_reset(G233SPIState *s)
 {
     fifo8_reset(&s->rx_fifo);
-    s->regs[R_SPI_SR] &= ~SPI_SR_RXNE;  /* RXNE = 0 (空) */
+    s->regs[R_SPI_SR] &= ~SPI_SR_RXNE;
 }
 
 static void g233_spi_update_cs(G233SPIState *s)
 {
     uint32_t csctrl = s->regs[R_SPI_CSCTRL];
     
-    /* 更新 CS0-CS3 */
     for (int i = 0; i < s->num_cs && i < 4; i++) {
-        bool enabled = csctrl & (1 << i);           /* CSx_EN */
-        bool active = csctrl & (1 << (i + 4));      /* CSx_ACT */
-        
-        /* CS 激活时为低电平 */
+        bool enabled = csctrl & (1 << i);
+        bool active = csctrl & (1 << (i + 4));
         qemu_set_irq(s->cs_lines[i], (enabled && active) ? 0 : 1);
     }
 }
@@ -54,23 +51,38 @@ static void g233_spi_update_irq(G233SPIState *s)
     /* TXE 中断 */
     if ((cr2 & SPI_CR2_TXEIE) && (sr & SPI_SR_TXE)) {
         irq_level = true;
-        printf("IRQ: TXE interrupt triggered (CR2=0x%02x, SR=0x%02x)\n", cr2, sr);
     }
     
     /* RXNE 中断 */
     if ((cr2 & SPI_CR2_RXNEIE) && (sr & SPI_SR_RXNE)) {
         irq_level = true;
-        printf("IRQ: RXNE interrupt triggered (CR2=0x%02x, SR=0x%02x)\n", cr2, sr);
     }
     
     /* 错误中断 */
     if ((cr2 & SPI_CR2_ERRIE) && 
         (sr & (SPI_SR_OVERRUN | SPI_SR_UNDERRUN))) {
         irq_level = true;
-        printf("IRQ: Error interrupt triggered (CR2=0x%02x, SR=0x%02x)\n", cr2, sr);
     }
     
     qemu_set_irq(s->irq, irq_level);
+}
+
+static void g233_spi_reset(DeviceState *d)
+{
+    G233SPIState *s = G233_SPI(d);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    
+    s->regs[R_SPI_CR1] = 0x00000000;
+    s->regs[R_SPI_CR2] = 0x00000000;
+    s->regs[R_SPI_SR] = 0x00000002;    /* TXE = 1 */
+    s->regs[R_SPI_DR] = 0x0000000C;
+    s->regs[R_SPI_CSCTRL] = 0x00000000;
+
+    g233_spi_txfifo_reset(s);
+    g233_spi_rxfifo_reset(s);
+    g233_spi_update_cs(s);
+    g233_spi_update_irq(s);
 }
 
 static void g233_spi_flush_txfifo(G233SPIState *s)
@@ -85,23 +97,34 @@ static void g233_spi_flush_txfifo(G233SPIState *s)
     
     /* 设置忙标志 */
     s->regs[R_SPI_SR] |= SPI_SR_BSY;
-    
-    printf("g233_spi_flush_txfifo: TX FIFO has %d bytes\n", 
-           fifo8_num_used(&s->tx_fifo));
 
     while (!fifo8_is_empty(&s->tx_fifo)) {
         tx = fifo8_pop(&s->tx_fifo);
-        printf("  SPI transfer: TX=0x%02x\n", tx);
         rx = ssi_transfer(s->spi, tx);
-        printf("  SPI transfer: RX=0x%02x\n", rx);
 
-        if (!fifo8_is_full(&s->rx_fifo)) {
-            fifo8_push(&s->rx_fifo, rx);
-            s->regs[R_SPI_SR] |= SPI_SR_RXNE;
-            printf("  RX FIFO pushed, RXNE set\n");
-        } else {
+        /* ✅ 关键修复：检查 OVERRUN 条件 */
+        if (s->regs[R_SPI_SR] & SPI_SR_RXNE) {
+            /* 
+             * RXNE 已经为 1，说明上一个接收的数据还未被读取
+             * 现在又收到新数据，触发 OVERRUN
+             */
             s->regs[R_SPI_SR] |= SPI_SR_OVERRUN;
-            printf("  RX FIFO full, OVERRUN set\n");
+            
+            /* 丢弃新数据，保留旧数据（这是标准行为）*/
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "g233_spi: OVERRUN detected - "
+                          "received new data while RXNE is set\n");
+        } else {
+            /* 正常接收数据 */
+            if (!fifo8_is_full(&s->rx_fifo)) {
+                fifo8_push(&s->rx_fifo, rx);
+                s->regs[R_SPI_SR] |= SPI_SR_RXNE;
+            } else {
+                /* RX FIFO 真的满了 */
+                s->regs[R_SPI_SR] |= SPI_SR_OVERRUN;
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "g233_spi: RX FIFO overflow\n");
+            }
         }
     }
     
@@ -111,27 +134,9 @@ static void g233_spi_flush_txfifo(G233SPIState *s)
     /* 更新 TXE 标志 */
     if (fifo8_is_empty(&s->tx_fifo)) {
         s->regs[R_SPI_SR] |= SPI_SR_TXE;
-        printf("  TX FIFO empty, TXE set\n");
     }
-}
-
-static void g233_spi_reset(DeviceState *d)
-{
-    G233SPIState *s = G233_SPI(d);
-
-    memset(s->regs, 0, sizeof(s->regs));
     
-    /* 复位值 */
-    s->regs[R_SPI_CR1] = 0x00000000;
-    s->regs[R_SPI_CR2] = 0x00000000;
-    s->regs[R_SPI_SR] = 0x00000002;    /* TXE = 1 */
-    s->regs[R_SPI_DR] = 0x0000000C;
-    s->regs[R_SPI_CSCTRL] = 0x00000000;
-
-    g233_spi_txfifo_reset(s);
-    g233_spi_rxfifo_reset(s);
-
-    g233_spi_update_cs(s);
+    /* 触发中断更新 */
     g233_spi_update_irq(s);
 }
 
@@ -197,9 +202,8 @@ static void g233_spi_write(void *opaque, hwaddr addr,
     addr >>= 2;
     switch (addr) {
     case R_SPI_CR1:
-        s->regs[R_SPI_CR1] = value & 0x44;  /* 只保留 SPE 和 MSTR 位 */
+        s->regs[R_SPI_CR1] = value & 0x44;
         
-        /* 如果禁用 SPI，重置 FIFO */
         if (!(value & SPI_CR1_SPE)) {
             g233_spi_txfifo_reset(s);
             g233_spi_rxfifo_reset(s);
@@ -207,30 +211,29 @@ static void g233_spi_write(void *opaque, hwaddr addr,
         break;
 
     case R_SPI_CR2:
-        s->regs[R_SPI_CR2] = value & 0xF0;  /* 保留中断使能位 */
+        s->regs[R_SPI_CR2] = value & 0xF0;
         break;
 
     case R_SPI_SR:
-        /* 写 1 清除错误标志 */
+        /* ✅ 写 1 清除错误标志 */
         if (value & SPI_SR_OVERRUN) {
             s->regs[R_SPI_SR] &= ~SPI_SR_OVERRUN;
         }
         if (value & SPI_SR_UNDERRUN) {
             s->regs[R_SPI_SR] &= ~SPI_SR_UNDERRUN;
         }
-        /* 其他位只读 */
+        /* 其他位只读，不处理 */
         break;
 
     case R_SPI_DR:
         if (!fifo8_is_full(&s->tx_fifo)) {
             fifo8_push(&s->tx_fifo, (uint8_t)value);
             
-            /* 清除 TXE */
             if (fifo8_is_full(&s->tx_fifo)) {
                 s->regs[R_SPI_SR] &= ~SPI_SR_TXE;
             }
             
-            /* 刷新 TX FIFO */
+            /* 立即刷新 TX FIFO */
             g233_spi_flush_txfifo(s);
         } else {
             /* TX FIFO 满，设置下溢错误 */
@@ -239,7 +242,7 @@ static void g233_spi_write(void *opaque, hwaddr addr,
         break;
 
     case R_SPI_CSCTRL:
-        s->regs[R_SPI_CSCTRL] = value & 0xFF;  /* 只保留低 8 位 */
+        s->regs[R_SPI_CSCTRL] = value & 0xFF;
         g233_spi_update_cs(s);
         break;
 
@@ -268,13 +271,9 @@ static void g233_spi_realize(DeviceState *dev, Error **errp)
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     G233SPIState *s = G233_SPI(dev);
 
-    /* 创建 SPI 总线 */
     s->spi = ssi_create_bus(dev, "spi");
-    
-    /* 初始化中断 */
     sysbus_init_irq(sbd, &s->irq);
 
-    /* 初始化 CS 线（最多 4 个）*/
     if (s->num_cs > 4) {
         s->num_cs = 4;
     }
@@ -283,12 +282,10 @@ static void g233_spi_realize(DeviceState *dev, Error **errp)
         sysbus_init_irq(sbd, &s->cs_lines[i]);
     }
 
-    /* 映射 MMIO */
     memory_region_init_io(&s->mmio, OBJECT(s), &g233_spi_ops, s,
                           TYPE_G233_SPI, 0x1000);
     sysbus_init_mmio(sbd, &s->mmio);
 
-    /* 创建 FIFO */
     fifo8_create(&s->tx_fifo, FIFO_CAPACITY);
     fifo8_create(&s->rx_fifo, FIFO_CAPACITY);
 }
@@ -307,6 +304,7 @@ static const VMStateDescription vmstate_g233_spi = {
 
 static const Property g233_spi_properties[] = {
     DEFINE_PROP_UINT32("num-cs", G233SPIState, num_cs, 4),
+    // DEFINE_PROP_END_OF_LIST(),
 };
 
 static void g233_spi_class_init(ObjectClass *klass, const void *data)
