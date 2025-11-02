@@ -56,10 +56,6 @@ static void g233_soc_init(Object *obj)
     G233SoCState *s = RISCV_G233_SOC(obj);
 
     object_initialize_child(obj, "cpus", &s->cpus, TYPE_RISCV_HART_ARRAY);
-    qdev_prop_set_uint32(DEVICE(&s->cpus), "num-harts", 1);
-    qdev_prop_set_uint32(DEVICE(&s->cpus), "hartid-base", 0);
-    qdev_prop_set_string(DEVICE(&s->cpus), "cpu-type", TYPE_RISCV_CPU_GEVICO_G233);
-    qdev_prop_set_uint64(DEVICE(&s->cpus), "resetvec", 0x1004);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_SIFIVE_GPIO);
 }
 
@@ -71,6 +67,10 @@ static void g233_soc_realize(DeviceState *dev, Error **errp)
     const MemMapEntry *memmap = g233_memmap;
 
     /* CPUs realize */
+    qdev_prop_set_uint32(DEVICE(&s->cpus), "num-harts", 1);
+    qdev_prop_set_uint32(DEVICE(&s->cpus), "hartid-base", 0);
+    qdev_prop_set_string(DEVICE(&s->cpus), "cpu-type", TYPE_RISCV_CPU_GEVICO_G233);
+    qdev_prop_set_uint64(DEVICE(&s->cpus), "resetvec", 0x1004);
     sysbus_realize(SYS_BUS_DEVICE(&s->cpus), &error_fatal);
 
     /* Mask ROM */
