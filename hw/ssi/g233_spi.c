@@ -54,20 +54,65 @@ static void g233_spi_update_irq(G233SPIState *s)
     /* TXE 中断 */
     if ((cr2 & SPI_CR2_TXEIE) && (sr & SPI_SR_TXE)) {
         irq_level = true;
+        printf("IRQ: TXE interrupt triggered (CR2=0x%02x, SR=0x%02x)\n", cr2, sr);
     }
     
     /* RXNE 中断 */
     if ((cr2 & SPI_CR2_RXNEIE) && (sr & SPI_SR_RXNE)) {
         irq_level = true;
+        printf("IRQ: RXNE interrupt triggered (CR2=0x%02x, SR=0x%02x)\n", cr2, sr);
     }
     
     /* 错误中断 */
     if ((cr2 & SPI_CR2_ERRIE) && 
         (sr & (SPI_SR_OVERRUN | SPI_SR_UNDERRUN))) {
         irq_level = true;
+        printf("IRQ: Error interrupt triggered (CR2=0x%02x, SR=0x%02x)\n", cr2, sr);
     }
     
     qemu_set_irq(s->irq, irq_level);
+}
+
+static void g233_spi_flush_txfifo(G233SPIState *s)
+{
+    uint8_t tx, rx;
+
+    /* 只有 SPI 使能且为主模式时才传输 */
+    if (!(s->regs[R_SPI_CR1] & SPI_CR1_SPE) ||
+        !(s->regs[R_SPI_CR1] & SPI_CR1_MSTR)) {
+        return;
+    }
+    
+    /* 设置忙标志 */
+    s->regs[R_SPI_SR] |= SPI_SR_BSY;
+    
+    printf("g233_spi_flush_txfifo: TX FIFO has %d bytes\n", 
+           fifo8_num_used(&s->tx_fifo));
+
+    while (!fifo8_is_empty(&s->tx_fifo)) {
+        tx = fifo8_pop(&s->tx_fifo);
+        printf("  SPI transfer: TX=0x%02x\n", tx);
+        rx = ssi_transfer(s->spi, tx);
+        printf("  SPI transfer: RX=0x%02x\n", rx);
+
+        if (!fifo8_is_full(&s->rx_fifo)) {
+            fifo8_push(&s->rx_fifo, rx);
+            s->regs[R_SPI_SR] |= SPI_SR_RXNE;
+            printf("  RX FIFO pushed, RXNE set\n");
+        } else {
+            s->regs[R_SPI_SR] |= SPI_SR_OVERRUN;
+            printf("  RX FIFO full, OVERRUN set\n");
+        }
+    }
+    
+    /* 清除忙标志 */
+    s->regs[R_SPI_SR] &= ~SPI_SR_BSY;
+    
+    /* 更新 TXE 标志 */
+    if (fifo8_is_empty(&s->tx_fifo)) {
+        s->regs[R_SPI_SR] |= SPI_SR_TXE;
+        printf("  TX FIFO empty, TXE set\n");
+    }
 }
 
 static void g233_spi_reset(DeviceState *d)
@@ -88,41 +133,6 @@ static void g233_spi_reset(DeviceState *d)
 
     g233_spi_update_cs(s);
     g233_spi_update_irq(s);
-}
-
-static void g233_spi_flush_txfifo(G233SPIState *s)
-{
-    uint8_t tx, rx;
-
-    /* 只有 SPI 使能且为主模式时才传输 */
-    if (!(s->regs[R_SPI_CR1] & SPI_CR1_SPE) ||
-        !(s->regs[R_SPI_CR1] & SPI_CR1_MSTR)) {
-        return;
-    }
-    
-    /* 设置忙标志 */
-    s->regs[R_SPI_SR] |= SPI_SR_BSY;
-
-    while (!fifo8_is_empty(&s->tx_fifo)) {
-        tx = fifo8_pop(&s->tx_fifo);
-        rx = ssi_transfer(s->spi, tx);
-
-        if (!fifo8_is_full(&s->rx_fifo)) {
-            fifo8_push(&s->rx_fifo, rx);
-            s->regs[R_SPI_SR] |= SPI_SR_RXNE;
-        } else {
-            /* RX FIFO 满，设置溢出错误 */
-            s->regs[R_SPI_SR] |= SPI_SR_OVERRUN;
-        }
-    }
-    
-    /* 清除忙标志 */
-    s->regs[R_SPI_SR] &= ~SPI_SR_BSY;
-    
-    /* 更新 TXE 标志 */
-    if (fifo8_is_empty(&s->tx_fifo)) {
-        s->regs[R_SPI_SR] |= SPI_SR_TXE;
-    }
 }
 
 static uint64_t g233_spi_read(void *opaque, hwaddr addr, unsigned int size)
